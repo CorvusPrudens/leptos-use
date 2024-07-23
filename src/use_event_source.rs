@@ -6,8 +6,8 @@ use leptos::prelude::diagnostics::SpecialNonReactiveZone;
 use leptos::prelude::wrappers::read::Signal;
 use leptos::prelude::*;
 use send_wrapper::SendWrapper;
-use std::cell::Cell;
 use std::marker::PhantomData;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -116,7 +116,7 @@ pub fn use_event_source<T, C>(
 ) -> UseEventSourceReturn<T, C::Error, impl Fn() + Clone + 'static, impl Fn() + Clone + 'static>
 where
     T: Clone + PartialEq + Send + Sync + 'static,
-    C: StringCodec<T> + Default,
+    C: StringCodec<T> + Default + Send + Sync,
     C::Error: Send + Sync,
 {
     use_event_source_with_options(url, UseEventSourceOptions::<T, C>::default())
@@ -129,7 +129,7 @@ pub fn use_event_source_with_options<T, C>(
 ) -> UseEventSourceReturn<T, C::Error, impl Fn() + Clone + 'static, impl Fn() + Clone + 'static>
 where
     T: Clone + PartialEq + Send + Sync + 'static,
-    C: StringCodec<T> + Default,
+    C: StringCodec<T> + Default + Send + Sync,
     C::Error: Send + Sync,
 {
     let UseEventSourceOptions {
@@ -151,8 +151,8 @@ where
     let (event_source, set_event_source) = signal(None::<SendWrapper<web_sys::EventSource>>);
     let (error, set_error) = signal(None::<UseEventSourceError<C::Error>>);
 
-    let explicitly_closed = Arc::new(Cell::new(false));
-    let retried = Arc::new(Cell::new(0));
+    let explicitly_closed = Arc::new(AtomicBool::new(false));
+    let retried = Arc::new(AtomicU64::new(0));
 
     let set_data_from_string = move |data_string: Option<String>| {
         if let Some(data_string) = data_string {
@@ -171,7 +171,7 @@ where
                 event_source.close();
                 set_event_source.set(None);
                 set_ready_state.set(ConnectionReadyState::Closed);
-                explicitly_closed.set(true);
+                explicitly_closed.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
     };
@@ -185,7 +185,7 @@ where
         move || {
             use wasm_bindgen::prelude::*;
 
-            if explicitly_closed.get() {
+            if explicitly_closed.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
 
@@ -218,12 +218,16 @@ where
 
                     // only reconnect if EventSource isn't reconnecting by itself
                     // this is the case when the connection is closed (readyState is 2)
-                    if es.ready_state() == 2 && !explicitly_closed.get() && reconnect_limit > 0 {
+                    if es.ready_state() == 2
+                        && !explicitly_closed.load(std::sync::atomic::Ordering::Relaxed)
+                        && reconnect_limit > 0
+                    {
                         es.close();
 
-                        retried.set(retried.get() + 1);
+                        let retried_value =
+                            retried.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
 
-                        if retried.get() < reconnect_limit {
+                        if retried_value < reconnect_limit {
                             set_timeout(
                                 move || {
                                     if let Some(init) = init.get_value() {
@@ -259,9 +263,9 @@ where
 
                 let _ = use_event_listener(
                     es.clone(),
-                    leptos::ev::Custom::<ev::Event>::new(event_name),
+                    leptos::ev::Custom::<leptos::ev::Event>::new(event_name),
                     move |e| {
-                        set_event.set(Some(e.clone()));
+                        set_event.set(Some(SendWrapper::new(e.clone())));
                         let data_string = js!(e["data"]).ok().and_then(|d| d.as_string());
                         set_data_from_string(data_string);
                     },
@@ -316,8 +320,8 @@ where
 #[derive(DefaultBuilder)]
 pub struct UseEventSourceOptions<T, C>
 where
-    T: 'static,
-    C: StringCodec<T>,
+    T: Send + Sync + 'static,
+    C: StringCodec<T> + Send + Sync,
 {
     /// Decodes from the received String to a value of type `T`.
     codec: C,
@@ -329,7 +333,7 @@ where
     reconnect_interval: u64,
 
     /// On maximum retry times reached.
-    on_failed: Arc<dyn Fn()>,
+    on_failed: Arc<dyn Fn() + Send + Sync>,
 
     /// If `true` the `EventSource` connection will immediately be opened when calling this function.
     /// If `false` you have to manually call the `open` function.
@@ -346,7 +350,11 @@ where
     _marker: PhantomData<T>,
 }
 
-impl<T, C: StringCodec<T> + Default> Default for UseEventSourceOptions<T, C> {
+impl<T, C> Default for UseEventSourceOptions<T, C>
+where
+    C: StringCodec<T> + Default + Send + Sync,
+    T: Send + Sync,
+{
     fn default() -> Self {
         Self {
             codec: C::default(),
